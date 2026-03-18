@@ -393,10 +393,12 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp format_project_link_lines do
+    tracker = Config.settings!().tracker
+
     project_part =
-      case Config.settings!().tracker.project_slug do
+      case tracker.project_slug do
         project_slug when is_binary(project_slug) and project_slug != "" ->
-          colorize(linear_project_url(project_slug), @ansi_cyan)
+          colorize(tracker_project_url(tracker.kind, project_slug, tracker.endpoint), @ansi_cyan)
 
         _ ->
           colorize("n/a", @ansi_gray)
@@ -427,7 +429,20 @@ defmodule SymphonyElixir.StatusDashboard do
     colorize("│ Next refresh: ", @ansi_bold) <> colorize("n/a", @ansi_gray)
   end
 
-  defp linear_project_url(project_slug), do: "https://linear.app/project/#{project_slug}/issues"
+  defp tracker_project_url("github", slug, endpoint) when is_binary(slug) do
+    base = github_web_base(endpoint)
+    "#{base}/#{slug}/issues"
+  end
+
+  defp tracker_project_url(_, slug, _) when is_binary(slug) do
+    "https://linear.app/project/#{slug}/issues"
+  end
+
+  defp tracker_project_url(_, _, _), do: nil
+
+  defp github_web_base("https://api.github.com"), do: "https://github.com"
+  defp github_web_base(endpoint) when is_binary(endpoint), do: String.replace(endpoint, "/api/v3", "")
+  defp github_web_base(_), do: "https://github.com"
 
   defp dashboard_url do
     dashboard_url(Config.settings!().server.host, Config.server_port(), HttpServer.bound_port())

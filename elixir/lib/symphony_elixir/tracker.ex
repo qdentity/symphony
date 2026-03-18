@@ -40,7 +40,9 @@ defmodule SymphonyElixir.Tracker do
   def adapter do
     case Config.settings!().tracker.kind do
       "memory" -> SymphonyElixir.Tracker.Memory
-      _ -> SymphonyElixir.Linear.Adapter
+      "github" -> SymphonyElixir.GitHub.Adapter
+      "linear" -> SymphonyElixir.Linear.Adapter
+      kind -> raise "unsupported tracker kind: #{inspect(kind)}"
     end
   end
 end

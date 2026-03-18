@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Config do
   alias SymphonyElixir.Workflow
 
   @default_prompt_template """
-  You are working on a Linear issue.
+  You are working on an issue.
 
   Identifier: {{ issue.identifier }}
   Title: {{ issue.title }}
@@ -119,7 +119,7 @@ defmodule SymphonyElixir.Config do
       is_nil(settings.tracker.kind) ->
         {:error, :missing_tracker_kind}
 
-      settings.tracker.kind not in ["linear", "memory"] ->
+      settings.tracker.kind not in ["linear", "memory", "github"] ->
         {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
 
       settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
@@ -127,6 +127,16 @@ defmodule SymphonyElixir.Config do
 
       settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
         {:error, :missing_linear_project_slug}
+
+      settings.tracker.kind == "github" and not is_binary(settings.tracker.api_key) ->
+        {:error, :missing_github_api_token}
+
+      settings.tracker.kind == "github" and not is_binary(settings.tracker.project_slug) ->
+        {:error, :missing_github_repository}
+
+      settings.tracker.kind == "github" and is_binary(settings.tracker.project_slug) and
+          not String.contains?(settings.tracker.project_slug, "/") ->
+        {:error, :missing_github_repository}
 
       true ->
         :ok

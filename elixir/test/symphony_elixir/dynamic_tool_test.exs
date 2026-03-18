@@ -307,4 +307,88 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert response["success"] == true
     assert response["output"] == ":ok"
   end
+
+  test "tool_specs returns github_api spec when tracker kind is github" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "ghp_test",
+      tracker_project_slug: "owner/repo"
+    )
+
+    assert [
+             %{
+               "name" => "github_api",
+               "description" => description,
+               "inputSchema" => %{
+                 "required" => ["method", "path"],
+                 "type" => "object"
+               }
+             }
+           ] = DynamicTool.tool_specs()
+
+    assert description =~ "GitHub"
+  end
+
+  test "linear_graphql returns unsupported-tool error when tracker kind is github" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "ghp_test",
+      tracker_project_slug: "owner/repo"
+    )
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Viewer { viewer { id } }"},
+        linear_client: fn _query, _variables, _opts ->
+          flunk("linear client should not be called in github mode")
+        end
+      )
+
+    assert response["success"] == false
+    assert Jason.decode!(response["output"])["error"]["message"] =~ "not available"
+  end
+
+  test "github_api executes REST requests and returns response" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "ghp_test",
+      tracker_project_slug: "owner/repo"
+    )
+
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "github_api",
+        %{"method" => "GET", "path" => "/repos/owner/repo/issues"},
+        github_client: fn method, path, body ->
+          send(test_pid, {:github_client_called, method, path, body})
+          {:ok, %{status: 200, body: [%{"number" => 1, "title" => "Test"}]}}
+        end
+      )
+
+    assert_received {:github_client_called, :get, "/repos/owner/repo/issues", nil}
+    assert response["success"] == true
+  end
+
+  test "github_api returns failure for non-2xx responses" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "ghp_test",
+      tracker_project_slug: "owner/repo"
+    )
+
+    response =
+      DynamicTool.execute(
+        "github_api",
+        %{"method" => "GET", "path" => "/repos/owner/repo/issues"},
+        github_client: fn _method, _path, _body ->
+          {:ok, %{status: 404, body: %{"message" => "Not Found"}}}
+        end
+      )
+
+    assert response["success"] == false
+    assert Jason.decode!(response["output"])["error"]["status"] == 404
+  end
 end
