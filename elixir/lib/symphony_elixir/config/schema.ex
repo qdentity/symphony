@@ -53,6 +53,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
       field(:state_label_prefix, :string, default: "state/")
+      field(:state_source, :string, default: "labels")
+      field(:project_number, :integer)
+      field(:project_status_field, :string, default: "Status")
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -60,9 +63,22 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states, :state_label_prefix],
+        [
+          :kind,
+          :endpoint,
+          :api_key,
+          :project_slug,
+          :assignee,
+          :active_states,
+          :terminal_states,
+          :state_label_prefix,
+          :state_source,
+          :project_number,
+          :project_status_field
+        ],
         empty_values: []
       )
+      |> validate_inclusion(:state_source, ["labels", "project"])
     end
   end
 

@@ -3,6 +3,23 @@ defmodule SymphonyElixir.GitHubTest do
 
   alias SymphonyElixir.GitHub.Adapter, as: GitHubAdapter
 
+  defmodule FakeProjectClient do
+    def update_project_item_status(issue_id, state_name) do
+      send(self(), {:project_update_status, issue_id, state_name})
+      Process.get({__MODULE__, :update_result}, :ok)
+    end
+
+    def fetch_project_status_map do
+      send(self(), :project_fetch_status_map)
+      Process.get({__MODULE__, :status_map_result}, {:ok, %{}})
+    end
+
+    def fetch_issue_project_status(issue_number) do
+      send(self(), {:project_fetch_issue_status, issue_number})
+      Process.get({__MODULE__, :issue_status_result}, {:ok, nil})
+    end
+  end
+
   defmodule FakeGitHubClient do
     def fetch_candidate_issues do
       send(self(), :gh_fetch_candidate_issues_called)
@@ -47,12 +64,19 @@ defmodule SymphonyElixir.GitHubTest do
 
   setup do
     github_client_module = Application.get_env(:symphony_elixir, :github_client_module)
+    project_client_module = Application.get_env(:symphony_elixir, :github_project_client_module)
 
     on_exit(fn ->
       if is_nil(github_client_module) do
         Application.delete_env(:symphony_elixir, :github_client_module)
       else
         Application.put_env(:symphony_elixir, :github_client_module, github_client_module)
+      end
+
+      if is_nil(project_client_module) do
+        Application.delete_env(:symphony_elixir, :github_project_client_module)
+      else
+        Application.put_env(:symphony_elixir, :github_project_client_module, project_client_module)
       end
     end)
 
@@ -63,6 +87,7 @@ defmodule SymphonyElixir.GitHubTest do
     )
 
     Application.put_env(:symphony_elixir, :github_client_module, FakeGitHubClient)
+    Application.put_env(:symphony_elixir, :github_project_client_module, FakeProjectClient)
     :ok
   end
 
@@ -247,5 +272,120 @@ defmodule SymphonyElixir.GitHubTest do
   test "state_label_prefix defaults to state/" do
     assert {:ok, settings} = Config.settings()
     assert settings.tracker.state_label_prefix == "state/"
+  end
+
+  # -------------------------------------------------------------------------
+  # state_source config
+  # -------------------------------------------------------------------------
+
+  test "state_source defaults to labels" do
+    assert {:ok, settings} = Config.settings()
+    assert settings.tracker.state_source == "labels"
+  end
+
+  test "state_source project is accepted with project_number" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "ghp_test",
+      tracker_project_slug: "owner/repo",
+      tracker_state_source: "project",
+      tracker_project_number: 3
+    )
+
+    assert {:ok, settings} = Config.settings()
+    assert settings.tracker.state_source == "project"
+    assert settings.tracker.project_number == 3
+  end
+
+  test "state_source project without project_number is rejected" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "ghp_test",
+      tracker_project_slug: "owner/repo",
+      tracker_state_source: "project"
+    )
+
+    assert {:error, :missing_github_project_number} = Config.validate!()
+  end
+
+  test "project_status_field defaults to Status" do
+    assert {:ok, settings} = Config.settings()
+    assert settings.tracker.project_status_field == "Status"
+  end
+
+  # -------------------------------------------------------------------------
+  # Write: update_issue_state with project mode
+  # -------------------------------------------------------------------------
+
+  test "update_issue_state in project mode calls project client, not labels" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "ghp_test",
+      tracker_project_slug: "owner/repo",
+      tracker_state_source: "project",
+      tracker_project_number: 3
+    )
+
+    assert :ok = GitHubAdapter.update_issue_state("42", "In Progress")
+
+    assert_receive {:project_update_status, "42", "In Progress"}
+    # Should NOT touch labels
+    refute_receive {:gh_get_issue_labels, _}
+    refute_receive {:gh_set_labels, _, _}
+    # Should still reopen (active state)
+    assert_receive {:gh_reopen_issue, "42"}
+  end
+
+  test "update_issue_state in project mode to terminal state closes issue" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "ghp_test",
+      tracker_project_slug: "owner/repo",
+      tracker_state_source: "project",
+      tracker_project_number: 3
+    )
+
+    assert :ok = GitHubAdapter.update_issue_state("42", "Done")
+
+    assert_receive {:project_update_status, "42", "Done"}
+    assert_receive {:gh_close_issue, "42"}
+  end
+
+  test "update_issue_state in project mode with issue_not_on_project still syncs github state" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "ghp_test",
+      tracker_project_slug: "owner/repo",
+      tracker_state_source: "project",
+      tracker_project_number: 3
+    )
+
+    Process.put({FakeProjectClient, :update_result}, {:error, :issue_not_on_project})
+
+    assert :ok =
+             capture_log(fn ->
+               assert :ok = GitHubAdapter.update_issue_state("42", "Done")
+             end)
+             |> then(fn log ->
+               assert log =~ "not on project board"
+               :ok
+             end)
+
+    assert_receive {:gh_close_issue, "42"}
+  end
+
+  test "update_issue_state in project mode propagates project client errors" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "ghp_test",
+      tracker_project_slug: "owner/repo",
+      tracker_state_source: "project",
+      tracker_project_number: 3
+    )
+
+    Process.put({FakeProjectClient, :update_result}, {:error, {:graphql_errors, ["oops"]}})
+
+    assert {:error, {:graphql_errors, ["oops"]}} = GitHubAdapter.update_issue_state("42", "Done")
+    refute_receive {:gh_close_issue, _}
   end
 end

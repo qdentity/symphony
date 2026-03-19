@@ -24,14 +24,40 @@ defmodule SymphonyElixir.GitHub.Client do
       is_nil(tracker.project_slug) ->
         {:error, :missing_github_repository}
 
-      true ->
-        with {:ok, assignee_filter} <- routing_assignee_filter() do
-          active_set = state_name_set(tracker.active_states)
-          prefix = tracker.state_label_prefix
+      tracker.state_source == "project" ->
+        fetch_candidate_issues_project(tracker)
 
-          fetch_open_issues(tracker, assignee_filter)
-          |> filter_by_state_labels(active_set, prefix, assignee_filter)
-        end
+      true ->
+        fetch_candidate_issues_labels(tracker)
+    end
+  end
+
+  defp fetch_candidate_issues_labels(tracker) do
+    with {:ok, assignee_filter} <- routing_assignee_filter() do
+      active_set = state_name_set(tracker.active_states)
+      prefix = tracker.state_label_prefix
+
+      fetch_open_issues(tracker, assignee_filter)
+      |> filter_by_state_labels(active_set, prefix, assignee_filter)
+    end
+  end
+
+  defp fetch_candidate_issues_project(tracker) do
+    with {:ok, assignee_filter} <- routing_assignee_filter(),
+         {:ok, raw_issues} <- fetch_open_issues(tracker, assignee_filter),
+         {:ok, status_map} <- project_client_module().fetch_project_status_map() do
+      active_set = state_name_set(tracker.active_states)
+
+      issues =
+        raw_issues
+        |> Enum.reject(&is_pull_request?/1)
+        |> Enum.map(&normalize_issue_with_project_state(&1, status_map, assignee_filter))
+        |> Enum.reject(&is_nil/1)
+        |> Enum.filter(fn issue ->
+          issue.state != nil and MapSet.member?(active_set, String.downcase(issue.state))
+        end)
+
+      {:ok, issues}
     end
   end
 
@@ -51,6 +77,9 @@ defmodule SymphonyElixir.GitHub.Client do
         is_nil(tracker.project_slug) ->
           {:error, :missing_github_repository}
 
+        tracker.state_source == "project" ->
+          fetch_issues_by_states_project(tracker, normalized)
+
         true ->
           with {:ok, assignee_filter} <- routing_assignee_filter() do
             state_set = state_name_set(normalized)
@@ -63,6 +92,25 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  defp fetch_issues_by_states_project(tracker, state_names) do
+    with {:ok, assignee_filter} <- routing_assignee_filter(),
+         {:ok, raw_issues} <- fetch_all_issues(tracker),
+         {:ok, status_map} <- project_client_module().fetch_project_status_map() do
+      state_set = state_name_set(state_names)
+
+      issues =
+        raw_issues
+        |> Enum.reject(&is_pull_request?/1)
+        |> Enum.map(&normalize_issue_with_project_state(&1, status_map, assignee_filter))
+        |> Enum.reject(&is_nil/1)
+        |> Enum.filter(fn issue ->
+          issue.state != nil and MapSet.member?(state_set, String.downcase(issue.state))
+        end)
+
+      {:ok, issues}
+    end
+  end
+
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids) when is_list(issue_ids) do
     ids = Enum.uniq(issue_ids)
@@ -72,9 +120,67 @@ defmodule SymphonyElixir.GitHub.Client do
     else
       tracker = Config.settings!().tracker
 
-      with {:ok, assignee_filter} <- routing_assignee_filter() do
-        fetch_issues_individually(ids, tracker, assignee_filter)
+      if tracker.state_source == "project" do
+        fetch_issue_states_by_ids_project(ids, tracker)
+      else
+        fetch_issue_states_by_ids_labels(ids, tracker)
       end
+    end
+  end
+
+  defp fetch_issue_states_by_ids_labels(ids, tracker) do
+    case routing_assignee_filter() do
+      {:ok, assignee_filter} -> fetch_issues_individually(ids, tracker, assignee_filter)
+      {:error, _} = error -> error
+    end
+  end
+
+  defp fetch_issue_states_by_ids_project(ids, tracker) do
+    case routing_assignee_filter() do
+      {:ok, assignee_filter} ->
+        reduce_project_issues(ids, tracker, assignee_filter)
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp reduce_project_issues(ids, tracker, assignee_filter) do
+    Enum.reduce_while(ids, {:ok, []}, fn id, {:ok, acc} ->
+      case fetch_single_issue_for_project(id, tracker, assignee_filter) do
+        {:ok, nil} -> {:cont, {:ok, acc}}
+        {:ok, issue} -> {:cont, {:ok, acc ++ [issue]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp fetch_single_issue_for_project(id, tracker, assignee_filter) do
+    {owner, repo} = parse_slug!(tracker.project_slug)
+    path = "/repos/#{owner}/#{repo}/issues/#{id}"
+
+    case api_request(:get, path) do
+      {:ok, %{status: 200, body: body}} ->
+        enrich_issue_with_project_status(body, id, assignee_filter)
+
+      {:ok, %{status: status}} when status in [404, 410] ->
+        {:ok, nil}
+
+      {:ok, %{status: status}} ->
+        {:error, {:github_api_status, status}}
+
+      {:error, reason} ->
+        {:error, {:github_api_request, reason}}
+    end
+  end
+
+  defp enrich_issue_with_project_status(body, id, assignee_filter) do
+    case project_client_module().fetch_issue_project_status(id) do
+      {:ok, status} ->
+        {:ok, normalize_issue_with_project_state(body, %{id => status}, assignee_filter)}
+
+      {:error, _} = error ->
+        error
     end
   end
 
@@ -152,6 +258,15 @@ defmodule SymphonyElixir.GitHub.Client do
   @spec ensure_state_labels() :: :ok
   def ensure_state_labels do
     tracker = Config.settings!().tracker
+
+    if tracker.state_source == "project" do
+      :ok
+    else
+      ensure_state_labels(tracker)
+    end
+  end
+
+  defp ensure_state_labels(tracker) do
     {owner, repo} = parse_slug!(tracker.project_slug)
     prefix = tracker.state_label_prefix
 
@@ -302,9 +417,7 @@ defmodule SymphonyElixir.GitHub.Client do
       state = determine_state(github_state, state_labels, prefix)
 
       if length(state_labels) > 1 do
-        Logger.warning(
-          "Issue ##{number_str} has multiple state labels: #{inspect(state_labels)}; using first alphabetically"
-        )
+        Logger.warning("Issue ##{number_str} has multiple state labels: #{inspect(state_labels)}; using first alphabetically")
       end
 
       %Issue{
@@ -511,7 +624,9 @@ defmodule SymphonyElixir.GitHub.Client do
   # Utility
   # ---------------------------------------------------------------------------
 
-  defp parse_slug!(slug) when is_binary(slug) do
+  @doc false
+  @spec parse_slug!(String.t()) :: {String.t(), String.t()}
+  def parse_slug!(slug) when is_binary(slug) do
     case String.split(slug, "/", parts: 2) do
       [owner, repo] -> {owner, repo}
       _ -> raise "Invalid project_slug: #{inspect(slug)}, expected owner/repo"
@@ -545,4 +660,48 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp parse_datetime(_), do: nil
+
+  # ---------------------------------------------------------------------------
+  # Project mode helpers
+  # ---------------------------------------------------------------------------
+
+  defp normalize_issue_with_project_state(issue, status_map, assignee_filter) when is_map(issue) do
+    number = issue["number"]
+
+    if is_nil(number) do
+      nil
+    else
+      number_str = to_string(number)
+      repo_name = repo_name_from_slug()
+      labels = issue["labels"] || []
+      label_names = Enum.map(labels, & &1["name"])
+
+      %Issue{
+        id: number_str,
+        identifier: "#{repo_name}##{number_str}",
+        title: issue["title"],
+        description: issue["body"],
+        priority: nil,
+        state: Map.get(status_map, number_str),
+        branch_name: nil,
+        url: issue["html_url"],
+        assignee_id: get_in(issue, ["assignee", "login"]),
+        blocked_by: [],
+        labels: Enum.map(label_names, &String.downcase/1),
+        assigned_to_worker: assigned_to_worker?(issue, assignee_filter),
+        created_at: parse_datetime(issue["created_at"]),
+        updated_at: parse_datetime(issue["updated_at"])
+      }
+    end
+  end
+
+  defp normalize_issue_with_project_state(_issue, _status_map, _assignee_filter), do: nil
+
+  defp project_client_module do
+    Application.get_env(
+      :symphony_elixir,
+      :github_project_client_module,
+      SymphonyElixir.GitHub.ProjectClient
+    )
+  end
 end

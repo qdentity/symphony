@@ -115,33 +115,49 @@ defmodule SymphonyElixir.Config do
   end
 
   defp validate_semantics(settings) do
-    cond do
-      is_nil(settings.tracker.kind) ->
-        {:error, :missing_tracker_kind}
-
-      settings.tracker.kind not in ["linear", "memory", "github"] ->
-        {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
-        {:error, :missing_linear_api_token}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
-        {:error, :missing_linear_project_slug}
-
-      settings.tracker.kind == "github" and not is_binary(settings.tracker.api_key) ->
-        {:error, :missing_github_api_token}
-
-      settings.tracker.kind == "github" and not is_binary(settings.tracker.project_slug) ->
-        {:error, :missing_github_repository}
-
-      settings.tracker.kind == "github" and is_binary(settings.tracker.project_slug) and
-          not String.contains?(settings.tracker.project_slug, "/") ->
-        {:error, :missing_github_repository}
-
-      true ->
-        :ok
+    with :ok <- validate_tracker_kind(settings.tracker) do
+      validate_tracker_credentials(settings.tracker)
     end
   end
+
+  defp validate_tracker_kind(%{kind: nil}), do: {:error, :missing_tracker_kind}
+  defp validate_tracker_kind(%{kind: k}) when k in ["linear", "memory", "github"], do: :ok
+  defp validate_tracker_kind(%{kind: k}), do: {:error, {:unsupported_tracker_kind, k}}
+
+  defp validate_tracker_credentials(%{kind: "linear", api_key: key}) when not is_binary(key),
+    do: {:error, :missing_linear_api_token}
+
+  defp validate_tracker_credentials(%{kind: "linear", project_slug: slug}) when not is_binary(slug),
+    do: {:error, :missing_linear_project_slug}
+
+  defp validate_tracker_credentials(%{kind: "linear"}), do: :ok
+
+  defp validate_tracker_credentials(%{kind: "github"} = tracker) do
+    with :ok <- validate_github_base(tracker) do
+      validate_github_project_mode(tracker)
+    end
+  end
+
+  defp validate_tracker_credentials(_tracker), do: :ok
+
+  defp validate_github_base(%{api_key: key}) when not is_binary(key),
+    do: {:error, :missing_github_api_token}
+
+  defp validate_github_base(%{project_slug: slug}) when not is_binary(slug),
+    do: {:error, :missing_github_repository}
+
+  defp validate_github_base(%{project_slug: slug}) do
+    if String.contains?(slug, "/"), do: :ok, else: {:error, :missing_github_repository}
+  end
+
+  defp validate_github_project_mode(%{state_source: src}) when src not in [nil, "labels", "project"],
+    do: {:error, :unsupported_state_source}
+
+  defp validate_github_project_mode(%{state_source: "project", project_number: n})
+       when not is_integer(n) or n <= 0,
+       do: {:error, :missing_github_project_number}
+
+  defp validate_github_project_mode(_tracker), do: :ok
 
   defp format_config_error(reason) do
     case reason do
